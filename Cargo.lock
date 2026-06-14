@@ -898,16 +898,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmic-hdr"
-version = "0.1.0"
-dependencies = [
- "cosmic-config",
- "libcosmic",
- "serde",
- "tokio",
-]
-
-[[package]]
 name = "cosmic-settings-config"
 version = "0.1.0"
 source = "git+https://github.com/pop-os/cosmic-settings-daemon#fa82bdf9fe7b5f5bd6008f32f393efd5e7a71c47"
@@ -2575,6 +2565,16 @@ checksum = "0fbe853b403ae61a04233030ae8a79d94975281ed9770a1f9e246732b534b28d"
 dependencies = [
  "bitflags 2.13.0",
  "serde",
+]
+
+[[package]]
+name = "kms-hdr-panel"
+version = "0.3.0"
+dependencies = [
+ "cosmic-config",
+ "libcosmic",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

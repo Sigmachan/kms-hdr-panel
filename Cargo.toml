@@ -1,12 +1,12 @@
 [package]
-name = "cosmic-hdr"
+name = "kms-hdr-panel"
 version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "HDR + NVIDIA gaming settings panel for COSMIC Desktop"
+description = "HDR & NVIDIA gaming settings panel — kms-hdr GUI"
 
 [[bin]]
-name = "cosmic-hdr"
+name = "kms-hdr-panel"
 path = "src/main.rs"
 
 [dependencies]

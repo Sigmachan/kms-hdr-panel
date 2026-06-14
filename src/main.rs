@@ -6,9 +6,9 @@ use cosmic::widget::{self, column, list_column, row, settings, text, toggler};
 use cosmic::{Application, ApplicationExt, Apply, Element};
 use tokio::process::Command;
 
-const APP_ID: &str = "ru.sigmachan.CosmicHdr";
-const BIN: &str = "/usr/local/bin/cosmic-hdr";
-const HDR_CAL: &str = "/usr/local/lib/cosmic-hdr/hdr-cal.py";
+const APP_ID: &str = "ru.sigmachan.KmsHdr";
+const BIN: &str = "/usr/local/bin/kms-hdr";
+const HDR_CAL: &str = "/usr/local/lib/kms-hdr/hdr-cal.py";
 
 // ── Connector / EDID detection ─────────────────────────────────────────────────
 
@@ -80,6 +80,27 @@ fn is_nvidia() -> bool {
     std::path::Path::new("/dev/nvidia0").exists()
 }
 
+fn gpu_vendor() -> &'static str {
+    if std::path::Path::new("/dev/nvidia0").exists() {
+        return "nvidia";
+    }
+    // Check /sys/class/drm/card*/device/vendor — 0x1002 = AMD, 0x8086 = Intel
+    if let Ok(rd) = std::fs::read_dir("/sys/class/drm") {
+        for e in rd.flatten() {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            if !s.starts_with("card") || s.contains('-') { continue; }
+            let vendor_path = format!("/sys/class/drm/{}/device/vendor", s);
+            if let Ok(v) = std::fs::read_to_string(&vendor_path) {
+                let v = v.trim();
+                if v == "0x1002" { return "amd"; }
+                if v == "0x8086" { return "intel"; }
+            }
+        }
+    }
+    "unknown"
+}
+
 fn nvibrant_available() -> bool {
     std::process::Command::new("which").arg("nvibrant")
         .output().map(|o| o.status.success()).unwrap_or(false)
@@ -87,7 +108,7 @@ fn nvibrant_available() -> bool {
 
 fn read_conf() -> HdrConf {
     let mut c = HdrConf::default();
-    if let Ok(s) = std::fs::read_to_string("/etc/cosmic-hdr.conf") {
+    if let Ok(s) = std::fs::read_to_string("/etc/kms-hdr.conf") {
         for line in s.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 match k.trim() {
@@ -173,7 +194,7 @@ async fn do_reset() -> Result<(), String> {
 
 fn service_active() -> bool {
     std::process::Command::new("systemctl")
-        .args(["is-active", "cosmic-hdr.service"])
+        .args(["is-active", "kms-hdr.service"])
         .output()
         .map(|o| o.stdout.starts_with(b"active"))
         .unwrap_or(false)
@@ -392,6 +413,7 @@ struct CosmicHdr {
     conf: HdrConf,
     nvidia_conf: NvidiaConf,
     is_nvidia: bool,
+    gpu_vendor: &'static str,
     hdr_enabled: bool,
     display: Option<DisplayInfo>,
     status: Option<String>,
@@ -408,17 +430,19 @@ impl Application for CosmicHdr {
     fn core_mut(&mut self) -> &mut Core { &mut self.core }
 
     fn init(core: Core, _flags: ()) -> (Self, Task<Message>) {
+        let gpu = gpu_vendor();
         let mut app = Self {
             core,
             conf: read_conf(),
             nvidia_conf: read_nvidia_conf(),
-            is_nvidia: is_nvidia(),
+            is_nvidia: gpu == "nvidia",
+            gpu_vendor: gpu,
             hdr_enabled: service_active(),
             display: parse_edid(),
             status: None,
             cal_child: None,
         };
-        app.set_header_title("HDR Display Settings".into());
+        app.set_header_title("HDR & Color Pipeline".into());
         (app, Task::none())
     }
 
@@ -551,12 +575,24 @@ impl Application for CosmicHdr {
                 ));
         }
 
+        // ── GPU vendor badge ──────────────────────────────────────────────────
+        let gpu_label = match self.gpu_vendor {
+            "amd"    => "AMD  ·  Full pipeline: DEGAMMA + CTM + GAMMA + saturation",
+            "intel"  => "Intel  ·  Full pipeline: DEGAMMA + CTM + GAMMA + saturation",
+            "nvidia" => "NVIDIA  ·  Gamma-only on desktop; full HDR + gaming features via hdr-game below",
+            _        => "GPU vendor unknown",
+        };
+        page = page.push(
+            text::caption(gpu_label).apply(widget::container)
+                .padding([0, 0, sp.space_xs, 0])
+        );
+
         // ── HDR toggle ────────────────────────────────────────────────────────
         page = page
             .push(text::heading("HDR Output"))
             .push(list_column().add(
                 settings::item::builder("Enable HDR10")
-                    .description("BT.2020 + PQ (ST2084) · cosmic-hdr.service")
+                    .description("BT.2020 + PQ (ST2084) · kms-hdr.service")
                     .control(toggler(self.hdr_enabled).on_toggle(Message::HdrToggle)),
             ));
 
@@ -598,7 +634,7 @@ impl Application for CosmicHdr {
         };
 
         page = page
-            .push(text::heading("Colour"))
+            .push(text::heading(if self.is_nvidia { "Colour  (AMD/Intel only)" } else { "Colour" }))
             .push(list_column()
                 .add(settings::item::builder("Target Gamut")
                     .description("Colour space the CTM matrix expands sRGB into")
@@ -617,7 +653,7 @@ impl Application for CosmicHdr {
 
         // ── Color intensity ───────────────────────────────────────────────────
         page = page
-            .push(text::heading("Color Intensity"))
+            .push(text::heading(if self.is_nvidia { "Color Intensity  (AMD/Intel only)" } else { "Color Intensity" }))
             .push(list_column().add(
                 settings::item::builder("Saturation")
                     .description("Color vividness via BT.709 saturation matrix · 100% = neutral · 150% = vivid")
