@@ -1,0 +1,31 @@
+[package]
+name = "cosmic-hdr"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "HDR display settings panel for COSMIC Desktop"
+
+[[bin]]
+name = "cosmic-hdr"
+path = "src/main.rs"
+
+[dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic", features = [
+    "winit",
+    "tokio",
+    "desktop",
+    "multi-window",
+] }
+cosmic-config = { git = "https://github.com/pop-os/libcosmic" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+strip = true
+
+[patch.'https://github.com/pop-os/libcosmic']
+libcosmic     = { path = "/home/sigmachan/.cargo/git/checkouts/libcosmic-41009aea1d72760b/9c2a86a" }
+cosmic-config = { path = "/home/sigmachan/.cargo/git/checkouts/libcosmic-41009aea1d72760b/9c2a86a/cosmic-config" }
+iced_winit    = { path = "/home/sigmachan/.cargo/git/checkouts/libcosmic-41009aea1d72760b/9c2a86a/iced/winit" }
