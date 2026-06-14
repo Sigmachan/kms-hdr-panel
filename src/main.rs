@@ -40,11 +40,17 @@ struct HdrConf {
     max_bpc: u32,
     gamut_mode: String,
     saturation: u32,
+    oled_preset: bool,
+    oled_dim_min: u32,   // auto-dim after N minutes (0 = off)
 }
 
 impl Default for HdrConf {
     fn default() -> Self {
-        Self { sdr_nits: 203, peak_nits: 800, gamut: 100, max_bpc: 10, gamut_mode: "bt2020".into(), saturation: 100 }
+        Self {
+            sdr_nits: 203, peak_nits: 800, gamut: 100, max_bpc: 10,
+            gamut_mode: "bt2020".into(), saturation: 100,
+            oled_preset: false, oled_dim_min: 0,
+        }
     }
 }
 
@@ -117,7 +123,9 @@ fn read_conf() -> HdrConf {
                     "GAMUT"      => { if let Ok(n) = v.trim().parse() { c.gamut      = n; } }
                     "MAX_BPC"    => { if let Ok(n) = v.trim().parse() { c.max_bpc    = n; } }
                     "GAMUT_MODE"  => { c.gamut_mode = v.trim().to_owned(); }
-                    "SATURATION"  => { if let Ok(n) = v.trim().parse() { c.saturation = n; } }
+                    "SATURATION"   => { if let Ok(n) = v.trim().parse() { c.saturation   = n; } }
+                    "OLED_PRESET"  => { c.oled_preset  = v.trim() == "1"; }
+                    "OLED_DIM_MIN" => { if let Ok(n) = v.trim().parse() { c.oled_dim_min = n; } }
                     _ => {}
                 }
             }
@@ -176,20 +184,49 @@ async fn write_nvidia_conf(c: NvidiaConf) -> Result<(), String> {
 async fn write_conf_and_apply(c: HdrConf) -> Result<(), String> {
     let s = Command::new("pkexec")
         .args([BIN, "--save",
-               "--sdr-nits",   &c.sdr_nits.to_string(),
-               "--peak-nits",  &c.peak_nits.to_string(),
-               "--gamut",      &c.gamut.to_string(),
-               "--bpc",        &c.max_bpc.to_string(),
-               "--gamut-mode", &c.gamut_mode,
-               "--saturation", &c.saturation.to_string()])
+               "--sdr-nits",    &c.sdr_nits.to_string(),
+               "--peak-nits",   &c.peak_nits.to_string(),
+               "--gamut",       &c.gamut.to_string(),
+               "--bpc",         &c.max_bpc.to_string(),
+               "--gamut-mode",  &c.gamut_mode,
+               "--saturation",  &c.saturation.to_string()])
         .status().await.map_err(|e| e.to_string())?;
-    if s.success() { Ok(()) } else { Err(format!("cosmic-hdr exited {s}")) }
+    if !s.success() { return Err(format!("kms-hdr exited {s}")); }
+    setup_oled_dim(c.oled_dim_min).await;
+    Ok(())
+}
+
+async fn setup_oled_dim(minutes: u32) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let svc_dir = format!("{home}/.config/systemd/user");
+    let svc_path = format!("{svc_dir}/kms-hdr-dim.service");
+    let _ = std::fs::create_dir_all(&svc_dir);
+
+    if minutes == 0 {
+        let _ = Command::new("systemctl")
+            .args(["--user", "disable", "--now", "kms-hdr-dim.service"]).status().await;
+        let _ = std::fs::remove_file(&svc_path);
+        return;
+    }
+
+    let secs = minutes * 60;
+    let content = format!(
+        "[Unit]\nDescription=kms-hdr OLED auto-dim (swayidle)\n\
+         [Service]\nType=simple\nRestart=on-failure\n\
+         ExecStart=swayidle -w timeout {secs} \"pkexec {BIN} --dim-to 50\" resume \"pkexec {BIN}\"\n\
+         [Install]\nWantedBy=default.target\n"
+    );
+    if std::fs::write(&svc_path, content).is_ok() {
+        let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status().await;
+        let _ = Command::new("systemctl")
+            .args(["--user", "enable", "--now", "kms-hdr-dim.service"]).status().await;
+    }
 }
 
 async fn do_reset() -> Result<(), String> {
     let s = Command::new("pkexec").args([BIN, "reset"])
         .status().await.map_err(|e| e.to_string())?;
-    if s.success() { Ok(()) } else { Err(format!("cosmic-hdr reset exited {s}")) }
+    if s.success() { Ok(()) } else { Err(format!("kms-hdr reset exited {s}")) }
 }
 
 fn service_active() -> bool {
@@ -217,6 +254,7 @@ struct DisplayInfo {
     max_lum_nits: u32,
     hdmi_ver: Option<String>, // "HDMI 1.4" / "HDMI 2.0" / "HDMI 2.1"
     dp_ver: Option<String>,   // "DP 1.4" etc. (DP connectors only)
+    is_oled: bool,            // detected via EDID name or sysfs panel_type
 }
 
 fn parse_edid() -> Option<DisplayInfo> {
@@ -342,6 +380,16 @@ fn parse_edid() -> Option<DisplayInfo> {
     // HDMI-CEC: kernel CEC framework exposes /dev/cec0 when the GPU driver supports it
     info.cec = std::path::Path::new("/dev/cec0").exists();
 
+    // OLED detection: name contains "OLED" (covers LG, Samsung, Sony, Philips OLED TVs)
+    // OR sysfs panel_type (some drivers expose this: "oled", "woled", "qd-oled")
+    info.is_oled = info.name.to_ascii_lowercase().contains("oled");
+    if !info.is_oled {
+        let panel_type_path = format!("/sys/class/drm/{}/panel_type", connector_dir);
+        if let Ok(pt) = std::fs::read_to_string(&panel_type_path) {
+            info.is_oled = pt.to_ascii_lowercase().contains("oled");
+        }
+    }
+
     Some(info)
 }
 
@@ -396,6 +444,9 @@ enum Message {
     ShowCalPat(CalibPattern),
     CalibrateHdr,
     CloseCalPat,
+    // OLED Care (only shown when is_oled detected)
+    OledPreset(bool),
+    OledDimTimeout(u32),
     // NVIDIA gaming features
     NvSmoothMotion(bool),
     NvReflex(bool),
@@ -504,6 +555,17 @@ impl Application for CosmicHdr {
                 if let Some(mut c) = self.cal_child.take() { let _ = c.kill(); }
             }
             // NVIDIA gaming controls — update conf, no immediate apply
+            Message::OledPreset(on) => {
+                self.conf.oled_preset = on;
+                if on {
+                    self.conf.sdr_nits  = 150;
+                    self.conf.peak_nits = 600;
+                } else {
+                    self.conf.sdr_nits  = 203;
+                    self.conf.peak_nits = 800;
+                }
+            }
+            Message::OledDimTimeout(v) => { self.conf.oled_dim_min = v; }
             Message::NvSmoothMotion(v) => { self.nvidia_conf.smooth_motion = v; }
             Message::NvReflex(v)       => { self.nvidia_conf.reflex         = v; }
             Message::NvVibrance(v)     => { self.nvidia_conf.vibrance       = v; }
@@ -769,6 +831,36 @@ impl Application for CosmicHdr {
                     .add(settings::item::builder("Apply NVIDIA Settings")
                         .description("Saves to /etc/hdr-game.conf — picked up by hdr-game on next launch")
                         .control(widget::button::suggested("Save").on_press(Message::NvApply)))
+                );
+        }
+
+        // ── OLED Care (only shown if display detected as OLED) ────────────────
+        let display_is_oled = self.display.as_ref().map(|d| d.is_oled).unwrap_or(false);
+        if display_is_oled {
+            let dim_label = if self.conf.oled_dim_min == 0 {
+                "Off".to_string()
+            } else {
+                format!("{} min", self.conf.oled_dim_min)
+            };
+
+            page = page
+                .push(text::heading("OLED Care"))
+                .push(list_column()
+                    .add(settings::item::builder("Longevity Preset")
+                        .description("SDR 150 nits · HDR peak 600 nits — reduces panel stress for daily desktop use")
+                        .control(toggler(self.conf.oled_preset).on_toggle(Message::OledPreset)))
+                    .add(settings::item::builder("Auto-Dim")
+                        .description("Dim to 50 nits after idle timeout via swayidle · requires swayidle installed")
+                        .control(
+                            row::with_capacity(2).spacing(sp.space_s).align_y(Alignment::Center)
+                                .push(widget::slider(0..=60u32, self.conf.oled_dim_min, Message::OledDimTimeout)
+                                    .step(5u32).width(Length::Fill))
+                                .push(text::body(dim_label)
+                                    .apply(widget::container).width(Length::Fixed(52.0))),
+                        ))
+                    .add(settings::item::builder("Pixel Shift")
+                        .description("Handled by COSMIC/KDE compositor — enable in Display → Screen Saver settings")
+                        .control(text::caption("compositor setting")))
                 );
         }
 
